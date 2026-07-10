@@ -529,12 +529,29 @@
     if(n>(S.stats.bestStreak||0))S.stats.bestStreak=n; return n;
   }
 
-  var saveTimer=null;
+  var saveTimer=null, ready=false, suspendPersist=false;
   function persist(){
+    if(!ready||suspendPersist)return;
     if(S)S.updatedAt=Date.now();
     var keys=Object.keys(S.days).sort(); while(keys.length>370){delete S.days[keys.shift()];}
     clearTimeout(saveTimer); saveTimer=setTimeout(function(){saveRaw(JSON.stringify(S));},180);
     scheduleCloud();
+  }
+  function saveLocalNow(){ try{ saveRaw(JSON.stringify(S)); }catch(e){} }
+  function pushCloudNow(code){ if(code) cloudSet(code,S); }
+  function hasContent(st){
+    if(!st||!st.days)return false;
+    if(st.tasks&&st.tasks.length)return true;
+    if(st.stats&&st.stats.achievedDates&&Object.keys(st.stats.achievedDates).length)return true;
+    var cs=["heyedu","paper","study"];
+    return Object.keys(st.days).some(function(k){var d=st.days[k]||{};
+      if(d.checks&&Object.keys(d.checks).some(function(x){return d.checks[x];}))return true;
+      if(d.other)return true;
+      if(d.otherItems&&d.otherItems.length)return true;
+      if(d.coreTasks&&cs.some(function(c){return d.coreTasks[c]&&d.coreTasks[c].length;}))return true;
+      if(d.timers&&cs.some(function(c){return d.timers[c]&&((d.timers[c].elapsed||0)>0||d.timers[c].running);}))return true;
+      return false;
+    });
   }
 
   function fmtTime(m){return String(Math.floor(m/60)).padStart(2,"0")+":"+String(m%60).padStart(2,"0");}
@@ -869,6 +886,7 @@
         if(!S.stats)S.stats={totalFocusMinutes:0,achievedDates:{},bestStreak:0,notify:false,lastNotifiedDate:null};
         if(!S.stats.achievedDates)S.stats.achievedDates={};
         if(!S.tasks)S.tasks=[];
+        S.updatedAt=Date.now();
         ensureDay(); setHeader(); showMotto(); renderAll(); buildRecap(); updateNotifBtn();
         showToast("백업을 불러왔어요. 이어서 작업하세요.");
       }catch(err){ showToast("파일을 읽지 못했어요."); }
@@ -921,17 +939,30 @@
     setSyncStatus(on?"동기화 켜짐":"동기화 꺼짐 (이 기기에만 저장)", on?"on":"off");
     var inp=document.getElementById("syncInput"); if(inp&&code)inp.value=code;
   }
+  function pullRemote(remote,label){
+    S=remote; normalize();
+    suspendPersist=true; renderEverything(); suspendPersist=false;
+    saveLocalNow(); setSyncStatus(label+" · "+nowHM(),"on");
+  }
   async function reconcileCloud(code){
     setSyncStatus("불러오는 중…","busy");
     var r=await cloudGet(code);
     if(!r.ok){ setSyncStatus("연결 실패 · 로컬 사용 중","off"); return; }
     var remote=r.data;
-    if(remote && remote.days){
+    var remoteHas = !!(remote && remote.days && hasContent(remote));
+    var localHas = hasContent(S);
+    // 1) 이 기기가 비어 있고 클라우드에 기록이 있으면 → 무조건 받아온다 (절대 덮어쓰지 않음)
+    if(remoteHas && !localHas){ pullRemote(remote,"기록 불러옴"); return; }
+    // 2) 이 기기에만 기록이 있으면 → 클라우드로 올린다
+    if(!remoteHas && localHas){ pushCloudNow(code); setSyncStatus("이 기기 기록 업로드됨 · "+nowHM(),"on"); return; }
+    // 3) 양쪽 다 기록이 있으면 → 더 최근 것을 사용
+    if(remoteHas && localHas){
       var lt=(S&&S.updatedAt)||0, rt=remote.updatedAt||0;
-      if(rt>lt){ S=remote; normalize(); renderEverything(); saveRaw(JSON.stringify(S)); setSyncStatus("최신 기록 불러옴 · "+nowHM(),"on"); }
-      else if(lt>rt){ cloudSet(code,S); }
-      else setSyncStatus("동기화됨 · "+nowHM(),"on");
-    } else { cloudSet(code,S); }
+      if(rt>lt){ pullRemote(remote,"최신 기록 불러옴"); } else { pushCloudNow(code); setSyncStatus("동기화됨 · "+nowHM(),"on"); }
+      return;
+    }
+    // 4) 양쪽 다 비어 있음
+    if(remote && remote.days){ pullRemote(remote,"동기화됨"); } else { pushCloudNow(code); setSyncStatus("동기화됨 · "+nowHM(),"on"); }
   }
   function genCode(){
     try{ var b=crypto.getRandomValues(new Uint8Array(12)); return Array.prototype.map.call(b,function(x){return ("0"+x.toString(16)).slice(-2);}).join(""); }
@@ -976,7 +1007,8 @@
     normalize();
     renderEverything(); morningNotify();
     updateSyncUI();
-    var code=getSyncCode(); if(code) reconcileCloud(code);
+    var code=getSyncCode(); if(code){ try{ await reconcileCloud(code); }catch(e){} }
+    ready=true;
     setInterval(function(){ if(anyRunning())tickTimers(); },1000);
     setInterval(function(){ markNow(); },60000);
     setInterval(function(){ if(anyRunning())persist(); },15000);
